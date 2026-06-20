@@ -31,6 +31,7 @@ from group_ranker import (
     set_rank_oc,
     get_user_details,
     send_ranked_webhook,
+    resolve_horns_role_id,
     log,
 )
 
@@ -99,6 +100,14 @@ def watch():
     log.info(f"ROBLOX_COOKIE set: {'yes' if ROBLOSECURITY else 'no'}")
     log.info(f"ACCEPT_PENDING={os.environ.get('ACCEPT_PENDING', 'true')}")
 
+    horns_rank_id = HORNS_RANK_ID
+    if HORNS_RANK_ID:
+        horns_rank_id = resolve_horns_role_id(GROUP_ID, HORNS_RANK_ID)
+        if horns_rank_id == 0:
+            log.error("HORNS_RANK_ID %s could not be resolved; ranking will be disabled", HORNS_RANK_ID)
+        elif horns_rank_id != HORNS_RANK_ID:
+            log.info("Resolved HORNS_RANK_ID %s to actual role ID %s", HORNS_RANK_ID, horns_rank_id)
+
     PROCESSED_PENDING = load_cache()
     log.info(f"Loaded watcher cache: {len(PROCESSED_PENDING)} processed pending uids")
 
@@ -149,7 +158,7 @@ def watch():
                             stats["errors"] += 1
 
                     # If user was accepted and now has horns, try to rank them immediately.
-                    if owns and HORNS_RANK_ID and not DRY_RUN:
+                    if owns and horns_rank_id and not DRY_RUN:
                         membership = find_membership_by_user(uid)
                         if membership:
                             log.info(f"  🔃 Found accepted user in group, ranking to {HORNS_RANK_ID}")

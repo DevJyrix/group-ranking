@@ -100,6 +100,47 @@ BATCH_PAUSE = 1.5   # seconds between page fetches
 CACHE_FILE  = ".horns_cache.json"  # track checked members to avoid re-checking
 
 
+def get_group_roles(group_id: int) -> list[dict]:
+    """Return all roles for the group, or [] if the request fails."""
+    data = inv_get(f"https://groups.roblox.com/v1/groups/{group_id}/roles")
+    if not data:
+        return []
+    return data.get("roles", []) if isinstance(data.get("roles", []), list) else []
+
+
+def resolve_horns_role_id(group_id: int, role_id: int) -> int:
+    """Return a valid group role ID for the requested value.
+
+    If the env value is already a role ID, return it when valid.
+    Otherwise, treat the value as a role rank and map it to the matching role ID.
+    """
+    if role_id <= 0:
+        return 0
+    roles = get_group_roles(group_id)
+    if not roles:
+        log.warning("Unable to validate HORNS_RANK_ID because group roles could not be fetched")
+        return role_id
+
+    for role in roles:
+        if role.get("id") == role_id:
+            return role_id
+
+    for role in roles:
+        if role.get("rank") == role_id:
+            mapped = role.get("id")
+            log.info(
+                "Mapped HORNS_RANK_ID env value %s to actual role id %s (%s)",
+                role_id, mapped, role.get("name", "<unknown>"),
+            )
+            return mapped
+
+    log.warning(
+        "HORNS_RANK_ID %s is not a valid role ID or role rank for group %s",
+        role_id, group_id,
+    )
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CACHE MANAGER — track already-checked members
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,6 +681,20 @@ def run():
     if ROBLOSECURITY:
         refresh_csrf()
 
+    horns_rank_id = HORNS_RANK_ID
+    if HORNS_RANK_ID:
+        horns_rank_id = resolve_horns_role_id(GROUP_ID, HORNS_RANK_ID)
+        if horns_rank_id == 0 and RANK_MEMBERS:
+            log.error(
+                "HORNS_RANK_ID %s could not be resolved to a valid role; "
+                "fix the env var or set RANK_MEMBERS=false",
+                HORNS_RANK_ID,
+            )
+            sys.exit(1)
+
+    if HORNS_RANK_ID and horns_rank_id != HORNS_RANK_ID:
+        log.info("Using resolved horn rank role ID %s", horns_rank_id)
+
     # Load cache
     cache = Cache(CACHE_FILE)
     cache.reset_pending()  # Pending list changes frequently, always re-check
@@ -704,7 +759,7 @@ def run():
             cur    = m["roleId"]
             mem_id = m["membershipId"]
 
-            if cur == HORNS_RANK_ID:
+            if cur == horns_rank_id:
                 stats["skipped"] += 1
                 continue
 
@@ -718,12 +773,12 @@ def run():
             owns, item = user_owns_horns(uid)
 
             if owns:
-                log.info("  ✅ Owns '%s' → ranking to %s", item, HORNS_RANK_ID)
-                if set_rank_oc(GROUP_ID, mem_id, HORNS_RANK_ID):
+                log.info("  ✅ Owns '%s' → ranking to %s", item, horns_rank_id)
+                if set_rank_oc(GROUP_ID, mem_id, horns_rank_id):
                     stats["ranked"] += 1
-                    cache.mark_member_checked(uid, HORNS_RANK_ID)
+                    cache.mark_member_checked(uid, horns_rank_id)
                     created, avatar_url = get_user_details(uid)
-                    send_ranked_webhook(uid, m.get("username", f"uid:{uid}"), HORNS_RANK_ID, item, owns, created, avatar_url)
+                    send_ranked_webhook(uid, m.get("username", f"uid:{uid}"), horns_rank_id, item, owns, created, avatar_url)
                 else:
                     stats["errors"] += 1
             else:
