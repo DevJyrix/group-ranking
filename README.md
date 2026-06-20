@@ -110,6 +110,43 @@ python group_ranker.py
 
 Always test with `DRY_RUN=true` first — it logs exactly what it would do without touching anything.
 
+## Performance — caching
+
+The script uses a local `.horns_cache.json` file to track members already checked. This means:
+
+- **First run**: Checks all pending requests and all unranked members
+- **Subsequent runs**: Only checks new pending requests and new members who joined since the last run
+- **Members who already got ranked**: Skipped (not re-checked)
+- **Members who haven't bought horns yet**: Cached after first check, skipped unless they change rank
+
+This makes the script super fast on repeated runs (every 5-10 minutes), while still catching new joins instantly.
+
+The cache resets if a member's rank changes (e.g., they buy horns and get promoted), so they'll be re-checked next run.
+
+## Instant ranking — watcher service
+
+A lightweight **watcher** service continuously polls pending requests every **~10 seconds** and instantly accepts/ranks horn owners the moment they join. No waiting for cron jobs.
+
+**How it works:**
+1. Watcher checks pending list every 10 sec
+2. Detects new join request
+3. Checks if they own horns
+4. If yes → **instantly accepts + ranks** (within 10-30 sec of joining)
+5. If no → declines and moves on
+
+**Setup on Railway (recommended):**
+1. In your Railway project, go to Settings → Service
+2. Choose **Generate from Procfile** or create a new service with type "Worker"
+3. Select `watcher: python watcher.py` from the Procfile
+4. Set the same environment variables (ROBLOX_API_KEY, GROUP_ID, HORNS_RANK_ID, etc.)
+5. Deploy
+
+Now you have two services running in parallel:
+- **`worker`** — batch cron job (ranks all members periodically)
+- **`watcher`** — instant service (accepts new horn owners as they join)
+
+Combined, they provide **instant acceptance** + **comprehensive coverage**.
+
 ## GitHub Actions (recommended alternative)
 
 You can run the ranker directly from GitHub Actions on a schedule (no Railway required). I added
