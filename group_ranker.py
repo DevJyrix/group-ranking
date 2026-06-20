@@ -462,7 +462,7 @@ def accept_join_request_legacy(group_id: int, user_id: int) -> bool:
         log.warning("    legacy accept requires ROBLOX_COOKIE")
         return False
 
-    url = f"https://groups.roblox.com/v1/groups/{group_id}/join-requests/users/{user_id}/accept"
+    url = f"https://groups.roblox.com/v1/groups/{group_id}/join-requests/users/{user_id}"
     try:
         r = INV_SESSION.post(url, timeout=10)
         if r.status_code == 403 and "Token Validation Failed" in r.text:
