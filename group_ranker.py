@@ -79,6 +79,7 @@ RANK_MEMBERS      = _env_bool("RANK_MEMBERS",       True)
 DECLINE_NON_OWNERS= _env_bool("DECLINE_NON_OWNERS", True)
 DRY_RUN           = _env_bool("DRY_RUN",            False)
 DISCORD_WEBHOOK   = _env("DISCORD_WEBHOOK")
+RANKED_WEBHOOK   = _env("RANKED_WEBHOOK")
 
 # Official Flaming Horns series asset IDs (confirmed from roblox.com/catalog URLs)
 HORNS_ASSET_IDS = {
@@ -111,7 +112,10 @@ class Cache:
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    data["checked_pending"] = set(data.get("checked_pending", []))
+                    data.setdefault("checked_members", {})
+                    return data
             except (json.JSONDecodeError, IOError):
                 pass
         return {"checked_members": {}, "checked_pending": set()}
@@ -136,13 +140,13 @@ class Cache:
             return True  # Don't re-check
         return False
 
-    def mark_pending_checked(self, user_id: int):
+    def mark_pending_checked(self, request_id: str):
         """Record that we processed a pending request."""
-        self.data["checked_pending"].add(str(user_id))
+        self.data["checked_pending"].add(str(request_id))
 
-    def was_pending_checked(self, user_id: int) -> bool:
+    def was_pending_checked(self, request_id: str) -> bool:
         """Skip pending requests we already processed (declined or accepted)."""
-        return str(user_id) in self.data["checked_pending"]
+        return str(request_id) in self.data["checked_pending"]
 
     def reset_pending(self):
         """Clear pending cache each run (it changes frequently)."""
@@ -351,6 +355,33 @@ def user_owns_horns(user_id: int) -> tuple[bool, str]:
     return False, ""
 
 
+def get_user_details(user_id: int) -> tuple[str, str]:
+    """Return account creation date and avatar image URL for a Roblox user."""
+    created = "unknown"
+    avatar_url = ""
+
+    try:
+        r = OC_SESSION.get(f"https://users.roblox.com/v1/users/{user_id}", timeout=10)
+        if r.status_code == 200:
+            profile = r.json()
+            created = profile.get("created", "unknown")
+    except requests.RequestException:
+        pass
+
+    try:
+        r = INV_SESSION.get(
+            f"https://avatar.roblox.com/v1/users/{user_id}/avatar", timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                avatar_url = data.get("imageUrl", "") or ""
+    except requests.RequestException:
+        pass
+
+    return created, avatar_url
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  GROUP API — using Open Cloud where possible, legacy endpoints as fallback
 #
@@ -383,10 +414,12 @@ def get_pending_members_legacy(group_id: int) -> list[dict]:
         for req in data.get("data", []):
             u = req.get("requester", {})
             uid = u.get("userId")
+            request_id = req.get("id") or req.get("requestId") or uid
             if uid:
                 pending.append({
-                    "userId":   uid,
-                    "username": u.get("username", f"uid:{uid}"),
+                    "requestId": request_id,
+                    "userId":    uid,
+                    "username":  u.get("username", f"uid:{uid}"),
                 })
         cursor = data.get("nextPageCursor")
         if not cursor:
@@ -396,10 +429,11 @@ def get_pending_members_legacy(group_id: int) -> list[dict]:
 
 
 def accept_join_request(group_id: int, user_id: int) -> bool:
-    """Accept a pending join request via Open Cloud v2."""
+    """Accept a pending join request via Open Cloud v2, with a legacy fallback."""
     if DRY_RUN:
         log.info("    [DRY RUN] would accept uid=%s", user_id)
         return True
+
     r = oc_post(
         f"{OC_BASE}/groups/{group_id}/memberships",
         json_body={"userId": f"users/{user_id}"},
@@ -407,10 +441,40 @@ def accept_join_request(group_id: int, user_id: int) -> bool:
     if r is not None and r.status_code in (200, 201, 204):
         log.info("    accept succeeded: uid=%s status=%s", user_id, r.status_code)
         return True
+
+    if r is not None and r.status_code == 404:
+        log.warning("    OC accept returned 404, falling back to legacy accept endpoint")
+        return accept_join_request_legacy(group_id, user_id)
+
     if r is not None:
         log.warning("    accept failed: uid=%s status=%s body=%s", user_id, r.status_code, r.text[:400])
     else:
         log.warning("    accept failed: uid=%s no response", user_id)
+    return False
+
+
+def accept_join_request_legacy(group_id: int, user_id: int) -> bool:
+    """Use legacy group endpoint to accept a pending join request."""
+    if DRY_RUN:
+        log.info("    [DRY RUN] would legacy-accept uid=%s", user_id)
+        return True
+    if not ROBLOSECURITY:
+        log.warning("    legacy accept requires ROBLOX_COOKIE")
+        return False
+
+    url = f"https://groups.roblox.com/v1/groups/{group_id}/join-requests/users/{user_id}/accept"
+    try:
+        r = INV_SESSION.post(url, timeout=10)
+        if r.status_code == 403 and "Token Validation Failed" in r.text:
+            log.info("    legacy accept auth failed, refreshing CSRF token")
+            refresh_csrf()
+            r = INV_SESSION.post(url, timeout=10)
+        if r.status_code in (200, 204):
+            log.info("    legacy accept succeeded: uid=%s status=%s", user_id, r.status_code)
+            return True
+        log.warning("    legacy accept failed: uid=%s status=%s body=%s", user_id, r.status_code, r.text[:400])
+    except requests.RequestException as e:
+        log.warning("    legacy accept error: uid=%s %s", user_id, e)
     return False
 
 
@@ -524,6 +588,33 @@ def send_summary(stats: dict):
         pass
 
 
+def send_ranked_webhook(user_id: int, username: str, role_id: int, item_name: str, owns: bool, created: str, avatar_url: str):
+    if not RANKED_WEBHOOK:
+        return
+
+    profile_url = f"https://www.roblox.com/users/{user_id}/profile"
+    ownership_text = "owns the tracked item" if owns else "does not own the tracked item"
+
+    embed = {
+        "title": f"User ranked: {username}",
+        "url": profile_url,
+        "description": (
+            f"**User:** [{username}]({profile_url})\n"
+            f"**User ID:** {user_id}\n"
+            f"**Ranked role ID:** {role_id}\n"
+            f"**Ownership:** {ownership_text} ({item_name})\n"
+            f"**Account created:** {created}"
+        ),
+        "color": 0x00FF00,
+        "thumbnail": {"url": avatar_url},
+        "footer": {"text": "Roblox Group Horns Ranker"},
+    }
+    try:
+        requests.post(RANKED_WEBHOOK, json={"embeds": [embed]}, timeout=8)
+    except requests.RequestException:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -564,12 +655,14 @@ def run():
         log.info("Found %d pending request(s).", len(pending))
 
         for p in pending:
+            raw_request_id = p.get("requestId")
+            request_id = str(raw_request_id) if raw_request_id is not None else None
             uid  = p["userId"]
             name = p["username"]
 
             # Skip if we already processed this pending request
-            if cache.was_pending_checked(uid):
-                log.info("Skipping pending (already processed): %s (uid=%s)", name, uid)
+            if request_id is not None and cache.was_pending_checked(request_id):
+                log.info("Skipping pending (already processed): %s (uid=%s, requestId=%s)", name, uid, request_id)
                 stats["cached_skipped"] += 1
                 continue
 
@@ -581,7 +674,8 @@ def run():
                 log.info("  ✅ Owns '%s' → accepting", item)
                 if accept_join_request(GROUP_ID, uid):
                     stats["accepted"] += 1
-                    cache.mark_pending_checked(uid)
+                    if request_id is not None:
+                        cache.mark_pending_checked(request_id)
                 else:
                     stats["errors"] += 1
             else:
@@ -590,7 +684,8 @@ def run():
                     log.info("     → declining")
                     if decline_join_request(GROUP_ID, uid):
                         stats["declined"] += 1
-                        cache.mark_pending_checked(uid)
+                        if request_id is not None:
+                            cache.mark_pending_checked(request_id)
                     else:
                         stats["errors"] += 1
 
@@ -627,6 +722,8 @@ def run():
                 if set_rank_oc(GROUP_ID, mem_id, HORNS_RANK_ID):
                     stats["ranked"] += 1
                     cache.mark_member_checked(uid, HORNS_RANK_ID)
+                    created, avatar_url = get_user_details(uid)
+                    send_ranked_webhook(uid, m.get("username", f"uid:{uid}"), HORNS_RANK_ID, item, owns, created, avatar_url)
                 else:
                     stats["errors"] += 1
             else:
