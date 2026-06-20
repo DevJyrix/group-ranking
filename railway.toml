@@ -2,6 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python group_ranker.py"
+startCommand = "python watcher.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
