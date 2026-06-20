@@ -78,7 +78,12 @@ def watch():
     if ROBLOSECURITY:
         refresh_csrf()
 
+    log.info(f"ROBLOX_API_KEY set: {'yes' if ROBLOX_API_KEY else 'no'}")
+    log.info(f"ROBLOX_COOKIE set: {'yes' if ROBLOSECURITY else 'no'}")
+    log.info(f"ACCEPT_PENDING={os.environ.get('ACCEPT_PENDING', 'true')}")
+
     PROCESSED_PENDING = load_cache()
+    log.info(f"Loaded watcher cache: {len(PROCESSED_PENDING)} processed pending uids")
 
     stats = {"accepted": 0, "declined": 0, "errors": 0, "runs": 0}
 
@@ -97,13 +102,15 @@ def watch():
 
                     # Skip if already processed
                     if uid in PROCESSED_PENDING:
-                        log.debug(f"Skipping {name} (already processed)")
+                        log.info(f"Skipping {name} (uid={uid}) — already processed")
                         continue
 
                     log.info(f"🆕 NEW PENDING: {name} (uid={uid})")
+                    log.info(f"    pending object: {p}")
 
                     # Check ownership
                     owns, item = user_owns_horns(uid)
+                    log.info(f"    ownership result for {uid}: owns={owns}, item={item}")
 
                     if owns:
                         log.info(f"  ✅ Owns '{item}' → accepting NOW")

@@ -44,6 +44,7 @@ ENVIRONMENT VARIABLES:
 import os
 import sys
 import time
+import json
 import logging
 import requests
 from requests.adapters import HTTPAdapter
@@ -95,6 +96,57 @@ HORNS_NAMES = {
 
 CALL_DELAY  = 0.4   # seconds between per-user checks
 BATCH_PAUSE = 1.5   # seconds between page fetches
+CACHE_FILE  = ".horns_cache.json"  # track checked members to avoid re-checking
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CACHE MANAGER — track already-checked members
+# ─────────────────────────────────────────────────────────────────────────────
+class Cache:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.data = self.load()
+
+    def load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {"checked_members": {}, "checked_pending": set()}
+
+    def save(self):
+        # Convert sets to lists for JSON serialization
+        save_data = {
+            "checked_members": self.data["checked_members"],
+            "checked_pending": list(self.data["checked_pending"]),
+        }
+        with open(self.filepath, "w") as f:
+            json.dump(save_data, f, indent=2)
+
+    def mark_member_checked(self, user_id: int, role_id: int):
+        """Record that we checked a member (store their role for next run)."""
+        self.data["checked_members"][str(user_id)] = {"role_id": role_id, "checked_at": time.time()}
+
+    def is_member_checked(self, user_id: int, current_role_id: int) -> bool:
+        """Skip if already checked AND still at same rank (not an owner yet)."""
+        cached = self.data["checked_members"].get(str(user_id))
+        if cached and cached.get("role_id") == current_role_id:
+            return True  # Don't re-check
+        return False
+
+    def mark_pending_checked(self, user_id: int):
+        """Record that we processed a pending request."""
+        self.data["checked_pending"].add(str(user_id))
+
+    def was_pending_checked(self, user_id: int) -> bool:
+        """Skip pending requests we already processed (declined or accepted)."""
+        return str(user_id) in self.data["checked_pending"]
+
+    def reset_pending(self):
+        """Clear pending cache each run (it changes frequently)."""
+        self.data["checked_pending"] = set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,10 +405,12 @@ def accept_join_request(group_id: int, user_id: int) -> bool:
         json_body={"userId": f"users/{user_id}"},
     )
     if r is not None and r.status_code in (200, 201, 204):
+        log.info("    accept succeeded: uid=%s status=%s", user_id, r.status_code)
         return True
-    # Log the response body to help debug permission issues
     if r is not None:
-        log.warning("    accept failed: %s %s", r.status_code, r.text[:200])
+        log.warning("    accept failed: uid=%s status=%s body=%s", user_id, r.status_code, r.text[:400])
+    else:
+        log.warning("    accept failed: uid=%s no response", user_id)
     return False
 
 
@@ -371,12 +425,20 @@ def decline_join_request(group_id: int, user_id: int) -> bool:
             timeout=10,
         )
         if r.status_code == 403 and "Token Validation Failed" in r.text:
+            log.info("    decline auth failed, refreshing CSRF token")
             refresh_csrf()
             r = INV_SESSION.delete(
                 f"https://groups.roblox.com/v1/groups/{group_id}/join-requests/users/{user_id}",
                 timeout=10,
             )
-        return r.status_code in (200, 204)
+        if r is not None and r.status_code in (200, 204):
+            log.info("    decline succeeded: uid=%s status=%s", user_id, r.status_code)
+            return True
+        if r is not None:
+            log.warning("    decline failed: uid=%s status=%s body=%s", user_id, r.status_code, r.text[:400])
+        else:
+            log.warning("    decline failed: uid=%s no response", user_id)
+        return False
     except requests.RequestException as e:
         log.warning("decline error: %s", e)
         return False
@@ -487,7 +549,11 @@ def run():
     if ROBLOSECURITY:
         refresh_csrf()
 
-    stats = {"accepted": 0, "declined": 0, "ranked": 0, "skipped": 0, "errors": 0}
+    # Load cache
+    cache = Cache(CACHE_FILE)
+    cache.reset_pending()  # Pending list changes frequently, always re-check
+
+    stats = {"accepted": 0, "declined": 0, "ranked": 0, "skipped": 0, "errors": 0, "cached_skipped": 0}
 
     # ─────────────────────────────────────────────────────────────
     #  STEP 1: pending join requests
@@ -500,6 +566,13 @@ def run():
         for p in pending:
             uid  = p["userId"]
             name = p["username"]
+
+            # Skip if we already processed this pending request
+            if cache.was_pending_checked(uid):
+                log.info("Skipping pending (already processed): %s (uid=%s)", name, uid)
+                stats["cached_skipped"] += 1
+                continue
+
             log.info("Checking pending: %s (uid=%s)", name, uid)
 
             owns, item = user_owns_horns(uid)
@@ -508,6 +581,7 @@ def run():
                 log.info("  ✅ Owns '%s' → accepting", item)
                 if accept_join_request(GROUP_ID, uid):
                     stats["accepted"] += 1
+                    cache.mark_pending_checked(uid)
                 else:
                     stats["errors"] += 1
             else:
@@ -516,6 +590,7 @@ def run():
                     log.info("     → declining")
                     if decline_join_request(GROUP_ID, uid):
                         stats["declined"] += 1
+                        cache.mark_pending_checked(uid)
                     else:
                         stats["errors"] += 1
 
@@ -538,6 +613,12 @@ def run():
                 stats["skipped"] += 1
                 continue
 
+            # Skip if cached and still at the same rank (hasn't bought horns yet)
+            if cache.is_member_checked(uid, cur):
+                log.debug("Skipping member uid=%s (cached, still at role %s)", uid, cur)
+                stats["cached_skipped"] += 1
+                continue
+
             log.info("Checking member uid=%s (current role=%s)", uid, cur)
             owns, item = user_owns_horns(uid)
 
@@ -545,20 +626,25 @@ def run():
                 log.info("  ✅ Owns '%s' → ranking to %s", item, HORNS_RANK_ID)
                 if set_rank_oc(GROUP_ID, mem_id, HORNS_RANK_ID):
                     stats["ranked"] += 1
+                    cache.mark_member_checked(uid, HORNS_RANK_ID)
                 else:
                     stats["errors"] += 1
             else:
                 log.debug("  no horns, leaving rank unchanged")
+                cache.mark_member_checked(uid, cur)
 
             time.sleep(CALL_DELAY)
+
+    # Save cache
+    cache.save()
 
     # ─────────────────────────────────────────────────────────────
     #  SUMMARY
     # ─────────────────────────────────────────────────────────────
     log.info(
-        "Done. accepted=%d declined=%d ranked=%d skipped=%d errors=%d",
+        "Done. accepted=%d declined=%d ranked=%d skipped=%d cached_skipped=%d errors=%d",
         stats["accepted"], stats["declined"], stats["ranked"],
-        stats["skipped"], stats["errors"],
+        stats["skipped"], stats["cached_skipped"], stats["errors"],
     )
     send_summary(stats)
 
