@@ -1,0 +1,35 @@
+name: horns-ranker
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Run hourly by default; adjust cron as desired
+    - cron: '0 * * * *'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run horns ranker
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          ROBLOX_COOKIE: ${{ secrets.ROBLOX_COOKIE }}
+          GROUP_ID: ${{ secrets.GROUP_ID }}
+          HORNS_RANK_ID: ${{ secrets.HORNS_RANK_ID }}
+          ACCEPT_PENDING: ${{ secrets.ACCEPT_PENDING }}
+          RANK_MEMBERS: ${{ secrets.RANK_MEMBERS }}
+          DECLINE_NON_OWNERS: ${{ secrets.DECLINE_NON_OWNERS }}
+          DRY_RUN: ${{ secrets.DRY_RUN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python group_ranker.py
